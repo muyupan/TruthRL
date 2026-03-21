@@ -392,6 +392,7 @@ def compute_score_subem(solution_str, ground_truth, method="strict", format_scor
 import os
 #from openai import OpenAI, APIConnectionError, RateLimitError
 
+import litellm
 from litellm import completion
 
 # Initialize OpenAI client
@@ -436,7 +437,7 @@ def get_system_message(type='outcome'):
 def attempt_api_call(messages, max_retries=3):
     for attempt in range(max_retries):
         try:
-            response = completion.create(
+            response = completion(
                 model="openai/meta-llama/Llama-3.3-70B-Instruct",
                 messages=messages,
                 temperature=0,
