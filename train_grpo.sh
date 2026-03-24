@@ -4,7 +4,7 @@ export RAY_DEDUP_LOGS=0
 export OPENAI_API_BASE=""
 export OPENAI_API_KEY="token-abc123"
 
-export WANDB_PROJECT="model1_step200_rollout32"
+export WANDB_PROJECT="model2_step20_rollout8"
 
 DATA_DIR=https://huggingface.co/datasets/weizhepei/TruthRL-CRAG/resolve/main # refer to HF data repo: weizhepei/TruthRL-CRAG
 
@@ -41,7 +41,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP_SIZE \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
-    actor_rollout_ref.rollout.n=32 \
+    actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.rollout.max_num_batched_tokens=131072 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
@@ -55,5 +55,5 @@ python3 -m verl.trainer.main_ppo \
     trainer.save_freq=20 \
     trainer.test_freq=5 \
     trainer.resume_mode=auto \
-    trainer.total_training_steps=200 \
+    trainer.total_training_steps=20 \
     trainer.total_epochs=100 $@
