@@ -1307,7 +1307,12 @@ class RayPPOTrainer:
                             p_hat = n_correct / n_attempts if n_attempts > 0 else 0.0
 
                             all_abstain = all(s == 0 for s in group_scores)
-                            abstain_reward = 0 if all_abstain else round((2 * p_hat) - 1, 3)
+                            if all_abstain:
+                                abstain_reward = 0
+                            elif p_hat <= 0.5:
+                                abstain_reward = round(1 - (2 * p_hat), 3)
+                            else:
+                                abstain_reward = round(0.5 * ((2 * p_hat) - 1), 3)
 
                             for score in group_scores:
                                 if score == 1:
