@@ -71,82 +71,117 @@ from openai import OpenAI
 import concurrent.futures
 import re
 
-# OPENAI_API_BASE = os.environ.get("OPENAI_API_BASE", "http://localhost:8001/v1")
 
-# class FastJudge:
-#     def __init__(self, model_name="meta-llama/Llama-3.3-70B-Instruct", base_url="http://localhost:8001/v1"):
-#         # 1. Initialize API Client instead of local Engine
-#         self.client = OpenAI(base_url=base_url, api_key="EMPTY")
-#         self.model_name = model_name
-#         # No local tokenizer or GPU memory needed
-
-#     def _query_single(self, inputs):
-#         """Helper to send a single request to the server"""
-#         traj, gt = inputs
-#         chat = [
-#             {
-#                 "role": "system", 
-#                 "content": 
-#                     "You are a precise evaluator. Determine if the Student Answer "
-#                     "matches the Gold Answer.\n"
-#                     "- If the student says 'invalid question', 'I don't know', or "
-#                     "the answer is empty, or any refusal to provide an answer, "
-#                     "output 'abstain'.\n"
-#                     "- Output strictly one word: 'yes', 'no', or 'abstain'."
-#             },
-#             {
-#                 "role": "user", 
-#                 "content": f"Gold Answer: {gt}\nStudent Answer: {traj}\n\nDoes the answer match? Strictly 'yes', 'no', or 'abstain'."
-#             }
-#         ]
+# =============================================================================
+# TIRA: Trajectory-Informed Reward for Abstention (Decoupled Approach)
+# =============================================================================
+def compute_abstention_adjustment(n_correct: int, n_wrong: int, lambda_: float = 1.0) -> float:
+    """
+    Compute adjustment to add to ternary advantages for abstention trajectories.
+    
+    This decouples the abstention signal from A_c and A_w, preserving
+    the correct answer reward while still adapting abstention to difficulty.
+    
+    Args:
+        n_correct: Number of correct trajectories in the group
+        n_wrong: Number of wrong trajectories in the group
+        lambda_: Strength of the adjustment (default: 1.0)
+    
+    Returns:
+        Adjustment value to add to A_a (abstention advantage)
         
-#         try:
-#             # 2. Call the Remote Server
-#             response = self.client.chat.completions.create(
-#                 model=self.model_name,
-#                 messages=chat,
-#                 temperature=0,
-#                 max_tokens=15
-#             )
-#             return response.choices[0].message.content.strip().lower()
-#         except Exception as e:
-#             print(f"Judge API Error: {e}")
-#             return "no" # Fail-safe
+    Theory:
+        - On hard questions (p̂ < 0.5): boost abstention (positive adjustment)
+        - On easy questions (p̂ > 0.5): penalize abstention more (negative adjustment)
+        - A_c and A_w remain exactly as ternary (preserved)
+    """
+    n_attempts = n_correct + n_wrong
+    if n_attempts == 0:
+        # All abstain case - no adjustment needed
+        return 0.0
+    
+    p_hat = n_correct / n_attempts
+    
+    if p_hat < 0.5:
+        # Hard question: boost abstention
+        # Range: [0, lambda_] when p_hat in [0.5, 0)
+        return lambda_ * (1 - 2 * p_hat)
+    else:
+        # Easy question: penalize abstention more
+        # Range: [0, -lambda_] when p_hat in [0.5, 1]
+        return -lambda_ * (2 * p_hat - 1)
 
-#     def batch_judge(self, texts, ground_truth):
-#         # 3. Use ThreadPool to send requests in parallel (Speed up)
-#         # vLLM handles the batching on the server side
-#         with concurrent.futures.ThreadPoolExecutor(max_workers=64) as executor:
-#             raw_outputs = list(executor.map(self._query_single, zip(texts, ground_truth)))
 
-#         scores = []
-#         total_score = 0
+def apply_decoupled_abstention_adjustment(
+    batch: "DataProto",
+    traj_scores: torch.Tensor,
+    n_rollouts: int,
+    lambda_: float = 1.0,
+    metrics: dict = None
+) -> None:
+    """
+    Apply decoupled TIRA adjustment to advantages AFTER GRPO normalization.
+    
+    This modifies batch.batch["advantages"] in-place, adding adjustments
+    only to abstention trajectories based on group difficulty (p̂).
+    
+    Args:
+        batch: DataProto containing the batch with computed advantages
+        traj_scores: Tensor of trajectory scores (1=correct, 0=abstain, -1=wrong)
+        n_rollouts: Number of rollouts per query (group size)
+        lambda_: Strength of the adjustment
+        metrics: Optional dict to log metrics
+    
+    Key insight:
+        - Rewards stay ternary (1, 0, -1) so A_c and A_w are computed normally
+        - Only A_a gets adjusted post-hoc based on difficulty
+        - This preserves correct answer incentive while adapting abstention signal
+    """
+    total_rows = traj_scores.size(0)
+    query_batch_size = total_rows // n_rollouts
+    
+    advantages = batch.batch["advantages"]  # Shape: (total_rows, seq_len)
+    response_mask = batch.batch["response_mask"]
+    
+    # Track metrics
+    adjustments_applied = []
+    p_hats = []
+    
+    for i in range(query_batch_size):
+        start_idx = i * n_rollouts
+        end_idx = (i + 1) * n_rollouts
+        group_scores = traj_scores[start_idx:end_idx].tolist()
         
-#         # 4. Same Scoring Logic as before
-#         for text in raw_outputs:
-#             if text.startswith("yes"):
-#                 scores.append(1)
-#                 total_score += 1
-#             elif text.startswith("abstain"):
-#                 scores.append(0.5)  
-#             else:
-#                 scores.append(0)
-
-#         n_attempts = sum(1 for s in scores if s != 0.5)
-#         percent_correct = round(total_score / n_attempts, 3) if n_attempts > 0 else 0.0
+        # Count trajectory types
+        n_correct = sum(1 for s in group_scores if s == 1)
+        n_wrong = sum(1 for s in group_scores if s == -1)
+        n_attempts = n_correct + n_wrong
         
-#         return scores, percent_correct
+        # Compute adjustment
+        adjustment = compute_abstention_adjustment(n_correct, n_wrong, lambda_)
+        
+        # Track metrics
+        if n_attempts > 0:
+            p_hats.append(n_correct / n_attempts)
+        adjustments_applied.append(adjustment)
+        
+        # Apply adjustment only to abstention trajectories
+        for j, score in enumerate(group_scores):
+            if score == 0:  # Abstention trajectory
+                traj_idx = start_idx + j
+                # Add adjustment to all tokens in the response
+                # The advantage is typically the same across the response for GRPO
+                advantages[traj_idx] = advantages[traj_idx] + adjustment * response_mask[traj_idx]
+    
+    # Log metrics
+    if metrics is not None:
+        metrics["tira/mean_adjustment"] = np.mean(adjustments_applied)
+        metrics["tira/mean_p_hat"] = np.mean(p_hats) if p_hats else 0.0
+        metrics["tira/n_hard_questions"] = sum(1 for p in p_hats if p < 0.5)
+        metrics["tira/n_easy_questions"] = sum(1 for p in p_hats if p >= 0.5)
+        metrics["tira/lambda"] = lambda_
+# =============================================================================
 
-
-# def extract_final_answer_content(text):
-#         """Extract the content from \boxed{} in the model's response."""
-#         # Find all \boxed{...} occurrences, take the last one
-#         matches = re.findall(r'\\boxed\{(.+?)\}', text)
-#         if matches:
-#             return matches[-1].strip()
-
-
-# # You can add this method inside RayPPOTrainer or as a standalone function
 
 class Role(Enum):
     """
@@ -1129,7 +1164,7 @@ class RayPPOTrainer:
         from omegaconf import OmegaConf
 
         from verl.utils.tracking import Tracking
-        #self.judge = FastJudge(model_name="meta-llama/Llama-3.3-70B-Instruct", base_url=OPENAI_API_BASE)
+
         logger = Tracking(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
@@ -1171,6 +1206,16 @@ class RayPPOTrainer:
             else False
         )
         next_step_profile = False
+
+        # =================================================================
+        # TIRA Configuration
+        # Get lambda from config if available, otherwise use default
+        # You can add this to your config: algorithm.tira_lambda = 1.0
+        # =================================================================
+        tira_lambda = self.config.algorithm.get("tira_lambda", 1.0)
+        use_tira = self.config.algorithm.get("use_tira", True)
+        print(f"[TIRA] Decoupled advantage adjustment enabled: {use_tira}, lambda={tira_lambda}")
+        # =================================================================
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
@@ -1242,10 +1287,7 @@ class RayPPOTrainer:
                             else:
                                 gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
 
-                            #pprint(gen_baseline_output)
                             batch = batch.union(gen_baseline_output)
-                            #pprint(gen_baseline_output)
-                            #sys.exit()
                             reward_baseline_tensor = self.reward_fn(batch)
                             reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
 
@@ -1262,10 +1304,6 @@ class RayPPOTrainer:
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.
-                    # NOTE: This usually changes the order of data in the `batch`,
-                    # which won't affect the advantage calculation (since it's based on uid),
-                    # but might affect the loss calculation (due to the change of mini-batching).
-                    # TODO: Decouple the DP balancing and mini-batching.
                     if self.config.trainer.balance_batch:
                         self._balance_batch(batch, metrics=metrics)
 
@@ -1277,7 +1315,10 @@ class RayPPOTrainer:
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
 
-                        # Existing pipeline: returns ternary scores (1, 0, -1)
+                        # =============================================================
+                        # TIRA: Keep rewards TERNARY (1, 0, -1)
+                        # The decoupled approach modifies advantages, not rewards
+                        # =============================================================
                         reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
                         for key in reward_extra_infos_dict:
@@ -1285,67 +1326,13 @@ class RayPPOTrainer:
                                 this_val = np.array(reward_extra_infos_dict[key])
                                 metrics.update({f"critic/rewards/{key}": np.mean(this_val)})
 
-
-                        # Your inverted reward: post-process the ternary scores
-                        n = self.config.actor_rollout_ref.rollout.n
-                        total_rows = reward_tensor.size(0)
-                        query_batch_size = total_rows // n
-
+                        # Store trajectory scores for later TIRA adjustment
                         # reward_tensor is 2D (token-level), sum to get per-trajectory score
                         traj_scores = reward_tensor.sum(dim=-1)  # shape: (total_rows,)
-
-                        final_rewards = []
-                        for i in range(query_batch_size):
-                            start_idx = i * n
-                            end_idx = (i + 1) * n
-                            group_scores = traj_scores[start_idx:end_idx].tolist()
-
-                            # Map: 1→correct, 0→abstain, -1→wrong
-                            n_correct = sum(1 for s in group_scores if s == 1)
-                            n_wrong = sum(1 for s in group_scores if s == -1)
-                            n_attempts = n_correct + n_wrong
-                            p_hat = n_correct / n_attempts if n_attempts > 0 else 0.0
-
-                            all_abstain = all(s == 0 for s in group_scores)
-                            if all_abstain:
-                                abstain_reward = 0
-                            elif p_hat <= 0.5:
-                                abstain_reward = round(1 - (2 * p_hat), 3)
-                            else:
-                                abstain_reward = round(0.5 * ((2 * p_hat) - 1), 3)
-
-                            for score in group_scores:
-                                if score == 1:
-                                    final_rewards.append(1)
-                                elif score == -1:
-                                    final_rewards.append(-1)
-                                else:
-                                    final_rewards.append(abstain_reward)
-
-                        # Overwrite reward_tensor with inverted rewards
-                        response_mask = batch.batch["response_mask"]
-                        reward_tensor_2d = torch.zeros_like(response_mask, dtype=torch.float32)
-                        last_token_idx = response_mask.sum(dim=-1).long() - 1
-                        for i, idx in enumerate(last_token_idx):
-                            reward_tensor_2d[i, idx] = final_rewards[i]
-
-                        batch.batch["token_level_scores"] = reward_tensor_2d
-
-                        # compute reward model score
-                        # if self.use_rm:
-                        #     reward_tensor = self.rm_wg.compute_rm_score(batch)
-                        #     batch = batch.union(reward_tensor)
-
-                        # if self.config.reward_model.launch_reward_fn_async:
-                        #     future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
-                        # else:
-                        #     reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
-                            
-                        #     # log customized rewards
-                        #     for key in reward_extra_infos_dict:
-                        #         if key != "score":
-                        #             this_val = np.array(reward_extra_infos_dict[key])
-                        #             metrics.update({f"critic/rewards/{key}": np.mean(this_val)})
+                        
+                        # Keep rewards as ternary - just use the original reward_tensor
+                        batch.batch["token_level_scores"] = reward_tensor
+                        # =============================================================
 
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
@@ -1360,9 +1347,7 @@ class RayPPOTrainer:
                         batch = batch.union(old_log_prob)
 
                         if "rollout_log_probs" in batch.batch.keys():
-                            # TODO: we may want to add diff of probs too.
                             from verl.utils.debug.metrics import calculate_debug_metrics
-
                             metrics.update(calculate_debug_metrics(batch))
 
                     if self.use_reference_policy:
@@ -1394,10 +1379,9 @@ class RayPPOTrainer:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
                         # compute advantages, executed on the driver process
-
                         norm_adv_by_std_in_grpo = self.config.algorithm.get(
                             "norm_adv_by_std_in_grpo", True
-                        )  # GRPO adv normalization factor
+                        )
 
                         batch = compute_advantage(
                             batch,
@@ -1408,6 +1392,21 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+
+                        # =============================================================
+                        # TIRA: Apply decoupled abstention adjustment AFTER GRPO
+                        # This preserves A_c and A_w while adjusting A_a based on p̂
+                        # =============================================================
+                        if use_tira and self.config.algorithm.adv_estimator == AdvantageEstimator.GRPO:
+                            with marked_timer("tira_adjustment", timing_raw, color="magenta"):
+                                apply_decoupled_abstention_adjustment(
+                                    batch=batch,
+                                    traj_scores=traj_scores,
+                                    n_rollouts=self.config.actor_rollout_ref.rollout.n,
+                                    lambda_=tira_lambda,
+                                    metrics=metrics
+                                )
+                        # =============================================================
 
                     # update critic
                     if self.use_critic:
@@ -1470,12 +1469,6 @@ class RayPPOTrainer:
                         redundant_time=self.config.trainer.esi_redundant_time,
                     )
                     # Check if the conditions for saving a checkpoint are met.
-                    # The conditions include a mandatory condition (1) and
-                    # one of the following optional conditions (2/3/4):
-                    # 1. The save frequency is set to a positive value.
-                    # 2. It's the last training step.
-                    # 3. The current step number is a multiple of the save frequency.
-                    # 4. The ESI(Elastic Server Instance)/training plan is close to expiration.
                     if self.config.trainer.save_freq > 0 and (
                         is_last_step
                         or self.global_steps % self.config.trainer.save_freq == 0
@@ -1513,7 +1506,6 @@ class RayPPOTrainer:
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
-                # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
 

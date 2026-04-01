@@ -4,7 +4,7 @@ export RAY_DEDUP_LOGS=0
 export OPENAI_API_BASE=""
 export OPENAI_API_KEY="token-abc123"
 
-export WANDB_PROJECT="model4_step200_rollout8"
+export WANDB_PROJECT="try2"
 
 DATA_DIR=https://huggingface.co/datasets/weizhepei/TruthRL-CRAG/resolve/main # refer to HF data repo: weizhepei/TruthRL-CRAG
 
@@ -55,5 +55,5 @@ python3 -m verl.trainer.main_ppo \
     trainer.save_freq=20 \
     trainer.test_freq=5 \
     trainer.resume_mode=disable \
-    trainer.total_training_steps=200 \
+    trainer.total_training_steps=20 \
     trainer.total_epochs=100 $@
