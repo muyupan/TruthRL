@@ -140,6 +140,9 @@ custom_reward_function:
 # config for the algorithm
 algorithm:
 
+  use_tira: true      # Enable/disable TIRA (default: true)
+  tira_lambda: 1.0    # Adjustment strength (default: 1.0)
+
   # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
   _target_: verl.trainer.config.AlgoConfig
 
@@ -339,7 +342,3 @@ ray_init:
 
   # Path to save Ray timeline JSON for performance profiling
   timeline_json_file: null
-
-algorithm:
-  use_tira: true      # Enable/disable TIRA (default: true)
-  tira_lambda: 1.0    # Adjustment strength (default: 1.0)
