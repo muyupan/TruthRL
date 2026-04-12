@@ -4,7 +4,7 @@ export RAY_DEDUP_LOGS=0
 export OPENAI_API_BASE=""
 export OPENAI_API_KEY="token-abc123"
 
-export WANDB_PROJECT="try2_try1_step20"
+export WANDB_PROJECT="try2_ablation2_step20"
 
 DATA_DIR=https://huggingface.co/datasets/weizhepei/TruthRL-CRAG/resolve/main # refer to HF data repo: weizhepei/TruthRL-CRAG
 

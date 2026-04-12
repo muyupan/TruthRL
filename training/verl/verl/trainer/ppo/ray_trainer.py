@@ -71,60 +71,6 @@ from openai import OpenAI
 import concurrent.futures
 import re
 
-def find_boxed_end_token_idx(token_ids, tokenizer):
-    """Find token index right after first \\boxed{...} closes."""
-    text_so_far = ""
-    brace_depth = 0
-    in_boxed = False
-    
-    for idx, tid in enumerate(token_ids):
-        token_str = tokenizer.decode([tid], skip_special_tokens=False)
-        text_so_far += token_str
-        
-        if not in_boxed:
-            if "\\boxed{" in text_so_far:
-                in_boxed = True
-                brace_depth = text_so_far.count("{") - text_so_far.count("}")
-        else:
-            for ch in token_str:
-                if ch == "{":
-                    brace_depth += 1
-                elif ch == "}":
-                    brace_depth -= 1
-                    if brace_depth == 0:
-                        return idx + 1
-    return None
-
-
-def truncate_masks_at_boxed(batch, tokenizer):
-    """Zero out response_mask and token_level_scores after first \\boxed{...}."""
-    input_ids = batch.batch["input_ids"]
-    response_mask = batch.batch["response_mask"]
-    reward_tensor = batch.batch["token_level_scores"]
-    
-    batch_size = input_ids.shape[0]
-    truncated_count = 0
-    total_tokens_saved = 0
-    
-    for i in range(batch_size):
-        resp_indices = (response_mask[i] == 1).nonzero(as_tuple=True)[0]
-        if len(resp_indices) == 0:
-            continue
-        
-        resp_start = resp_indices[0].item()
-        resp_len = len(resp_indices)
-        resp_tokens = input_ids[i, resp_start:resp_start + resp_len].tolist()
-        
-        cut_offset = find_boxed_end_token_idx(resp_tokens, tokenizer)
-        
-        if cut_offset is not None and cut_offset < resp_len:
-            tokens_to_zero = resp_len - cut_offset
-            response_mask[i, resp_start + cut_offset:] = 0
-            reward_tensor[i, resp_start + cut_offset:] = 0
-            truncated_count += 1
-            total_tokens_saved += tokens_to_zero
-    
-    return truncated_count, total_tokens_saved
 
 # =============================================================================
 # TIRA: Trajectory-Informed Reward for Abstention (Decoupled Approach)
@@ -1381,26 +1327,41 @@ class RayPPOTrainer:
                                 metrics.update({f"critic/rewards/{key}": np.mean(this_val)})
 
                         # Store trajectory scores for later TIRA adjustment
-                        # reward_tensor is 2D (token-level), sum to get per-trajectory score
                         traj_scores = reward_tensor.sum(dim=-1)  # shape: (total_rows,)
                         
-                        # Keep rewards as ternary - just use the original reward_tensor
+                        # =============================================================
+                        # LENGTH PENALTY: Penalize ALL long responses to prevent
+                        # </think> padding exploit
+                        # =============================================================
+                        response_mask = batch.batch["response_mask"]
+                        response_lengths = response_mask.sum(dim=-1).float()  # (total_rows,)
+                        max_response_length = float(response_mask.shape[-1])  # e.g., 2048
+                        
+                        # Get length penalty coefficient from config (default 0.1)
+                        length_penalty_coef = self.config.algorithm.get("length_penalty_coef", 0.1)
+                        
+                        # Compute length penalty (negative = penalizes longer responses)
+                        # Range: [0, -length_penalty_coef] as length goes from 0 to max
+                        length_penalty = -length_penalty_coef * (response_lengths / max_response_length)
+                        
+                        # Log length metrics
+                        metrics["response_length/mean"] = response_lengths.mean().item()
+                        metrics["response_length/max"] = response_lengths.max().item()
+                        metrics["response_length/min"] = response_lengths.min().item()
+                        metrics["response_length/length_penalty_mean"] = length_penalty.mean().item()
+                        
+                        # Add length penalty to reward_tensor (on last token of each response)
+                        total_rows = reward_tensor.shape[0]
+                        for i in range(total_rows):
+                            last_token_idx = int(response_mask[i].sum().item()) - 1
+                            if last_token_idx >= 0:
+                                reward_tensor[i, last_token_idx] = reward_tensor[i, last_token_idx] + length_penalty[i]
+                        
+                        # Update traj_scores with length penalty for TIRA
+                        traj_scores = traj_scores + length_penalty
+                        
                         batch.batch["token_level_scores"] = reward_tensor
                         # =============================================================
-                        # =============================================================
-                        # TRUNCATE: Zero out loss on tokens after first \boxed{}
-                        # Model still generates them, but receives no gradient signal
-                        # =============================================================
-                        truncated_count, tokens_saved = truncate_masks_at_boxed(batch, self.tokenizer)
-                        total_responses = reward_tensor.shape[0]
-                        metrics["truncation/count"] = truncated_count
-                        metrics["truncation/ratio"] = truncated_count / total_responses
-                        metrics["truncation/tokens_saved"] = tokens_saved
-                        
-                        # Recompute traj_scores after truncation
-                        traj_scores = batch.batch["token_level_scores"].sum(dim=-1)
-                        # =============================================================
-
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)

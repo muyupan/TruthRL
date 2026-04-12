@@ -141,7 +141,7 @@ custom_reward_function:
 algorithm:
 
   use_tira: true      # Enable/disable TIRA (default: true)
-  tira_lambda: 1.0    # Adjustment strength (default: 1.0)
+  tira_lambda: 0.3    # Adjustment strength (default: 1.0)
 
   # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
   _target_: verl.trainer.config.AlgoConfig
