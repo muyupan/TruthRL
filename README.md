@@ -1,90 +1,70 @@
-<h1 align="center">
-TruthRL 
-</h1>
+# TIAR: Teaching LLM Abstention through Self-Confidence Estimation and GRPO
 
-<h3 align="center">
-Incentivizing Truthful LLMs via Reinforcement Learning <br>
-[<a href="https://arxiv.org/abs/2509.25760">arXiv</a>]
-[<a href="https://x.com/weizhepei/status/1973211813522317519">Summary</a>]
-</h3>
-
-TruthRL is a simple yet effective truthfulness-driven reinforcement learning (RL) method that significantly reduces hallucinations in large language models (LLMs) by enabling proper abstention while preserving accuracy.
-
-
-## Why TruthRL?
-***Factual accuracy alone does NOT necessarily guarantee truthfulness!***
-
-A model that answers fewer questions correctly while reliably abstaining when uncertain is far more trustworthy than a higher-accuracy model that frequently fabricates plausible but incorrect answers.
+This repository contains the official implementation of the paper **"Teaching LLM abstention through self-confidence estimation and Group Relative Policy Optimization" (TIAR)**.
 <center>
-  <img width="1084" height="409" alt="image" src="https://github.com/facebookresearch/TruthRL/blob/main/TruthRL.png" />
+  <img width="2100" height="300" alt="image" src="./TIAR3.png" />
 </center>
+## Overview
 
-In vanilla supervised fine-tuning (SFT) or RL, the model is optimized solely for accuracy, implicitly rewarding hallucinations over abstentions and thus always attempting to answer or guess, which ultimately compromises truthfulness. In contrast, TruthRL not only **rewards correct answers**, but explicitly **penalizes hallucinations**, and **treats abstentions neutrally**, thereby leading to greater truthfulness.
+Large Language Models (LLMs) often hallucinate when faced with out-of-knowledge (OOK) queries. **TIAR** addresses this by teaching models to gracefully abstain (e.g., by saying "I don't know") using a novel Reinforcement Learning (RL) approach.
+
+Building upon **Group Relative Policy Optimization (GRPO)** and the ternary reward system (Correct: +1, Wrong: -1, Abstain: 0), TIAR introduces **Trajectory-Informed Advantage Reweighting**. This method dynamically adjusts the abstention reward advantage based on the model's self-estimated confidence across sampled trajectories. By leveraging GRPO's multiple trajectories as a natural signal for uncertainty, TIAR effectively reduces hallucinations without penalizing correct responses.
+
+## Repository Structure
+
+- `data_utils/`: Scripts for data retrieval and preparing OOK questions via knowledge boundary probing.
+- `training/`: Core training frameworks.
+    - `verl/`: The primary RLHF/GRPO training framework modified to support TIAR's advantage reweighting.
+    - `open-r1/`: Additional training utilities and recipes.
+- `evaluation/`: Scripts and prompts for the two-stage LLM-as-a-Judge evaluation pipeline.
+- `train_sft.sh`: Script for Supervised Fine-Tuning baseline.
+- `train_dpo.sh`: Script for Direct Preference Optimization baseline.
+- `train_grpo.sh`: Script for launching GRPO and TIAR training runs.
 
 ## Installation
-Run the following script to create a Python virtual environment for TruthRL training.
+
+We recommend using Conda to manage your environment. The training stack relies on the `verl` framework.
+
 ```bash
-conda create -n truthrl-verl python=3.10 -y
-conda activate truthrl-verl
-conda install nvidia/label/cuda-12.4.0::cuda-toolkit
+# Create and activate environment
+conda create -n tiar python=3.10 -y
+conda activate tiar
 
+# Install core dependencies
+pip install -r evaluation/requirements.txt
+
+# Install the modified verl training framework
 cd training/verl
-USE_MEGATRON=0 bash scripts/install_vllm_sglang_mcore.sh
-
-pip install numpy==1.26.1 opentelemetry-sdk==1.26.0 opentelemetry-sdk==1.26.0 click==8.2.1 tensordict==0.8.1
-
-pip install --no-deps -e .
-
-huggingface-cli login
-wandb login
+pip install -e .
 ```
-
 
 ## Training
 
-The training requires an LLM verifier to judge whether the predicted answer aligns with the reference answer and produce reward signals. If not hosting locally, please change `OPENAI_API_BASE` in `train_grpo.sh` to the base URL where you host the verifier model. By default, the training script is set for 8 x H100 80G GPUs. Please adjust `N_GPUS`  based on your compute resource.
+### 1. Supervised Fine-Tuning (SFT)
+Trains the baseline with relabeled out-of-knowledge questions:
+```bash
+bash train_sft.sh
+```
 
-```shell
-conda activate truthrl-verl
+### 2. Direct Preference Optimization (DPO)
+Trains on preference pairs where "I don't know" is preferred over incorrect answers:
+```bash
+bash train_dpo.sh
+```
+
+### 3. TIAR (GRPO with Advantage Reweighting)
+Executes the main TIAR training loop:
+```bash
 bash train_grpo.sh
 ```
 
 ## Evaluation
 
-Run the following script to create a Python virtual environment for TruthRL training.
+The evaluation employs an LLM-as-a-Judge pipeline (Llama-3.1-8B-Instruct) in two stages:
+1. **Abstention Classification**: Detects if the model provided an "I don't know" style response.
+2. **Factuality Check**: Evaluates the correctness of the answer if the model did not abstain.
+
 ```bash
-conda create -n truthrl-eval python=3.10 -y
-conda activate truthrl-eval
-
 cd evaluation
-pip install -r requirements.txt
+python evaluate.py --model_path <path_to_model>
 ```
-
-Use the following script to evaluate the model. Note that the evaluation also requires a LLM to judge whether the predicted answer aligns with the reference answer. If not hosting locally, please change `api_url` in `evaluate.py` to the base URL where you host the verifier model.
-
-
-```shell
-conda activate truthrl-eval
-python evaluate.py
-```
-
-
-## Bugs or Questions?
-If you have any questions related to the code or the paper, feel free to email Zhepei (zhepei.wei@virginia.edu). If you encounter any problems when using the code, or want to report a bug, feel free to open an issue! Please try to specify the problem with details so we can help you better and quicker!
-
-## Citation
-Please cite our paper if you find the repo helpful in your work:
-
-```bibtex
-@article{
-wei2025truthrl,
-title={Truth{RL}: Incentivizing Truthful {LLMs} via Reinforcement Learning},
-author={Wei, Zhepei and Yang, Xiao and Sun, Kai and Wang, Jiaqi and Shao, Rulin and Chen, Sean and Kachuee, Mohammad and Gollapudi, Teja and Liao, Tony and Scheffer, Nicolas and Wanga, Rakesh and Kumar, Anuj and Meng, Yu and Yih, Wen-tau and Dong, Xin Luna},
-journal={arXiv preprint arXiv:2509.25760},
-year={2025},
-}
-```
-
-## License
-TruthRL is Creative Commons Attribution-NonCommercial 4.0 International License licensed, as found in the LICENSE file.
-
