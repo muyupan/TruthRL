@@ -2,7 +2,7 @@
 
 This repository contains the official implementation of the paper **"Teaching LLM abstention through self-confidence estimation and Group Relative Policy Optimization" (TIAR)**.
 <center>
-  <img width="2100" height="300" alt="image" src="./TIAR3.png" />
+  <img width="1920" height="1080" alt="image" src="./TIAR3.png" />
 </center>
 ## Overview
 
